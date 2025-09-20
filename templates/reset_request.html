@@ -1,0 +1,68 @@
+{% extends "base.html" %}
+
+{% block title %}Reset Password{% endblock %}
+
+{% block content %}
+<div class="form-container">
+    <h1 class="form-title">Reset Password</h1>
+    
+    <form method="POST" action="{{ url_for('reset_request') }}">
+        <div class="form-group">
+            <label class="form-label" for="email">Email Address</label>
+            <input class="form-input" type="email" id="email" name="email" required>
+        </div>
+        
+        <button type="submit" class="btn btn-full">Send Reset Link</button>
+    </form>
+    
+    <p style="text-align: center; margin-top: 1.5rem;">
+        Remember your password? <a href="{{ url_for('login') }}">Login here</a>
+    </p>
+</div>
+
+<style>
+.form-container {
+    max-width: 400px;
+    margin: 2rem auto;
+    padding: 2rem;
+    background: white;
+    border-radius: 8px;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+}
+
+.form-title {
+    text-align: center;
+    margin-bottom: 2rem;
+}
+
+.form-group {
+    margin-bottom: 1rem;
+}
+
+.form-label {
+    display: block;
+    margin-bottom: 0.5rem;
+}
+
+.form-input {
+    width: 100%;
+    padding: 0.5rem;
+    border: 1px solid #ddd;
+    border-radius: 4px;
+}
+
+.btn-full {
+    width: 100%;
+    padding: 0.75rem;
+    background: #2196F3;
+    color: white;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+}
+
+.btn-full:hover {
+    background: #1976D2;
+}
+</style>
+{% endblock %}
