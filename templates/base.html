@@ -22,14 +22,14 @@
             
             <div class="nav-menu">
                 {% if session.user_id %}
-                    <span class="user-info"><i class="fas "></i> Hello, {{ session.username }}</span>
-
-                    <a href="{{ url_for('index') }}"><i class="fas"></i> Feed</a>
-                    <a href="{{ url_for('post') }}"><i class="fas "></i> Share Work</a>
-                    <a href="{{ url_for('logout') }}"><i class="fas "></i> Logout</a>
+                    <span class="user-info"><i class="fas fa-user"></i> Hello, {{ session.username }}</span>
+                    <a href="{{ url_for('index') }}"><i class="fas fa-home"></i> Feed</a>
+                    <a href="{{ url_for('posts') }}"><i class="fas fa-book"></i> My Works</a>
+                    <a href="{{ url_for('post') }}"><i class="fas fa-share"></i> Share Work</a>
+                    <a href="{{ url_for('logout') }}"><i class="fas fa-sign-out-alt"></i> Logout</a>
                 {% else %}
-                    <a href="{{ url_for('login') }}"><i class="fas "></i> Login</a>
-                    <a href="{{ url_for('register') }}"><i class="fas "></i> Register</a>
+                    <a href="{{ url_for('login') }}"><i class="fas fa-sign-in-alt"></i> Login</a>
+                    <a href="{{ url_for('register') }}"><i class="fas fa-user-plus"></i> Register</a>
                 {% endif %}
             </div>
         </div>
