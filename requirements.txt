@@ -4,5 +4,5 @@ Werkzeug==2.3.7
 standard-imghdr
 Flask-Mail
 psycopg2-binary
-standard-imghdr
+
 
