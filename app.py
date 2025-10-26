@@ -485,3 +485,6 @@ def reset_token(token):
         return redirect(url_for('login'))
         
     return render_template('reset_token.html', token=token)
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0',debug=True)
