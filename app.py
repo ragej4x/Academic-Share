@@ -1,11 +1,13 @@
-from flask import Flask, render_template, request, redirect, url_for, session, flash, send_from_directory
+from flask import Flask, render_template, request, redirect, url_for, session, flash, send_file
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
 from flask_mail import Mail, Message
 from itsdangerous import URLSafeTimedSerializer
 import secrets
 import os
-import sqlite3
+import psycopg2
+import psycopg2.extras
+from io import BytesIO
 import imghdr
 from datetime import datetime
 
@@ -19,45 +21,53 @@ mail = Mail(app)
 s = URLSafeTimedSerializer(app.config['SECRET_KEY'])
 
 
-# Database initialization
 def init_db():
-    conn = sqlite3.connect('academic_share.db')
-    c = conn.cursor()
-    
-def init_db():
-    conn = sqlite3.connect('academic_share.db')
-    c = conn.cursor()
-    
-    # Users table
-    c.execute('''CREATE TABLE IF NOT EXISTS users
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  username TEXT UNIQUE NOT NULL,
-                  email TEXT UNIQUE NOT NULL,
-                  first_name TEXT NOT NULL,
-                  last_name TEXT NOT NULL,
-                  section TEXT NOT NULL,
-                  lrn TEXT UNIQUE NOT NULL,
-                  password TEXT NOT NULL,
-                  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
-    
-    # Posts table
-    c.execute('''CREATE TABLE IF NOT EXISTS posts
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  user_id INTEGER NOT NULL,
-                  title TEXT NOT NULL,
-                  description TEXT,
-                  filename TEXT,
-                  filepath TEXT,
-                  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                  FOREIGN KEY (user_id) REFERENCES users (id))''')
-    conn.commit()
-    conn.close()
+        # Initialize Postgres DB and create tables if they don't exist
+        conn = psycopg2.connect(app.config['DATABASE_URL'])
+        cur = conn.cursor()
+
+        # Users table
+        cur.execute('''CREATE TABLE IF NOT EXISTS users (
+                                         id SERIAL PRIMARY KEY,
+                                         username TEXT UNIQUE NOT NULL,
+                                         email TEXT UNIQUE NOT NULL,
+                                         first_name TEXT NOT NULL,
+                                         last_name TEXT NOT NULL,
+                                         section TEXT NOT NULL,
+                                         lrn TEXT UNIQUE NOT NULL,
+                                         password TEXT NOT NULL,
+                                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+
+                                     )''')
+
+        # Posts table (store file binary data in DB using bytea)
+        cur.execute('''CREATE TABLE IF NOT EXISTS posts (
+                                         id SERIAL PRIMARY KEY,
+                                         user_id INTEGER NOT NULL,
+                                         title TEXT NOT NULL,
+                                         description TEXT,
+                                         filename TEXT,
+                                         filedata BYTEA,
+                                         mimetype TEXT,
+                                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                                         FOREIGN KEY (user_id) REFERENCES users (id)
+                                     )''')
+
+        # If this app was previously using a posts table with 'filepath', ensure new columns exist.
+        # ALTER TABLE ... ADD COLUMN IF NOT EXISTS is safe when upgrading an existing DB.
+        cur.execute("ALTER TABLE posts ADD COLUMN IF NOT EXISTS filedata BYTEA")
+        cur.execute("ALTER TABLE posts ADD COLUMN IF NOT EXISTS mimetype TEXT")
+
+        conn.commit()
+        cur.close()
+        conn.close()
 
 init_db()
 
 def get_db_connection():
-    conn = sqlite3.connect('academic_share.db')
-    conn.row_factory = sqlite3.Row
+    # Return a new psycopg2 connection. Callers should close it.
+    # Use RealDictCursor when creating cursors to get dict-like rows.
+    conn = psycopg2.connect(app.config['DATABASE_URL'])
     return conn
 
 def is_logged_in():
@@ -69,10 +79,18 @@ def allowed_file(filename):
 
 def is_image_file(filepath):
     """Check if the file is an image"""
+    # Accept either a filename (with extension) or a mimetype string
     if not filepath:
         return False
+    # If it's a mimetype like 'image/png'
+    if isinstance(filepath, str) and filepath.startswith('image/'):
+        return True
+    # Otherwise treat as filename
     allowed_extensions = {'png', 'jpg', 'jpeg', 'gif'}
-    return '.' in filepath and filepath.rsplit('.', 1)[1].lower() in allowed_extensions
+    try:
+        return '.' in filepath and filepath.rsplit('.', 1)[1].lower() in allowed_extensions
+    except Exception:
+        return False
 
 def get_file_icon(filename):
     """Return appropriate Font Awesome icon based on file type"""
@@ -116,12 +134,15 @@ def index():
         return redirect(url_for('login'))
     
     conn = get_db_connection()
-    posts = conn.execute('''
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute('''
         SELECT posts.*, users.username 
         FROM posts 
         JOIN users ON posts.user_id = users.id 
         ORDER BY posts.created_at DESC
-    ''').fetchall()
+    ''')
+    posts = cur.fetchall()
+    cur.close()
     conn.close()
     
     return render_template('index.html', posts=posts, is_image_file=is_image_file)
@@ -152,24 +173,29 @@ def register():
         hashed_password = generate_password_hash(password)
         
         conn = get_db_connection()
+        cur = conn.cursor()
         try:
-            conn.execute('''INSERT INTO users 
+            cur.execute('''INSERT INTO users 
                           (username, email, first_name, last_name, section, lrn, password) 
-                          VALUES (?, ?, ?, ?, ?, ?, ?)''',
-                          (username, email, first_name, last_name, section, lrn, hashed_password))
+                          VALUES (%s, %s, %s, %s, %s, %s, %s)''',
+                        (username, email, first_name, last_name, section, lrn, hashed_password))
             conn.commit()
             flash('Registration successful! Please log in.', 'success')
             return redirect(url_for('login'))
-        except sqlite3.IntegrityError as e:
-            if 'username' in str(e):
+        except psycopg2.IntegrityError as e:
+            conn.rollback()
+            msg = str(e)
+            # Try to detect which unique constraint failed
+            if 'username' in msg:
                 flash('Username already exists!', 'error')
-            elif 'email' in str(e):
+            elif 'email' in msg:
                 flash('Email already registered!', 'error')
-            elif 'lrn' in str(e):
+            elif 'lrn' in msg:
                 flash('LRN already registered!', 'error')
             else:
                 flash('Registration failed!', 'error')
         finally:
+            cur.close()
             conn.close()
     
     return render_template('register.html')
@@ -185,9 +211,12 @@ def login():
         password = request.form['password']
         
         conn = get_db_connection()
-        user = conn.execute('SELECT * FROM users WHERE username = ?', (username,)).fetchone()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute('SELECT * FROM users WHERE username = %s', (username,))
+        user = cur.fetchone()
+        cur.close()
         conn.close()
-        
+
         if user and check_password_hash(user['password'], password):
             session['user_id'] = user['id']
             session['username'] = user['username']
@@ -219,24 +248,29 @@ def post():
             return render_template('post.html')
         
         filename = None
-        filepath = None
-        
+        filedata = None
+        mimetype = None
+
         if file and file.filename:
             if allowed_file(file.filename):
                 filename = secure_filename(file.filename)
-                filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-                file.save(filepath)
-                flash('File uploaded successfully!', 'success')
+                # read bytes into memory to store in DB
+                file.stream.seek(0)
+                filedata = file.read()
+                mimetype = file.mimetype or None
+                flash('File uploaded and stored in database!', 'success')
             else:
                 flash('File type not allowed!', 'error')
                 return render_template('post.html')
-        
+
         conn = get_db_connection()
-        conn.execute('INSERT INTO posts (user_id, title, description, filename, filepath) VALUES (?, ?, ?, ?, ?)',
-                     (session['user_id'], title, description, filename, filepath))
+        cur = conn.cursor()
+        cur.execute('INSERT INTO posts (user_id, title, description, filename, filedata, mimetype) VALUES (%s, %s, %s, %s, %s, %s)',
+                 (session['user_id'], title, description, filename, psycopg2.Binary(filedata) if filedata else None, mimetype))
         conn.commit()
+        cur.close()
         conn.close()
-        
+
         flash('Your academic work has been shared!', 'success')
         return redirect(url_for('index'))
     
@@ -249,18 +283,21 @@ def view_post(post_id):
         return redirect(url_for('login'))
     
     conn = get_db_connection()
-    post = conn.execute('''
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute('''
         SELECT posts.*, users.username 
         FROM posts 
         JOIN users ON posts.user_id = users.id 
-        WHERE posts.id = ? AND posts.user_id = ?
-    ''', (post_id, session['user_id'])).fetchone()
+        WHERE posts.id = %s AND posts.user_id = %s
+    ''', (post_id, session['user_id']))
+    post = cur.fetchone()
+    cur.close()
     conn.close()
     
     if post is None:
         flash('Post not found or you do not have permission to view it!', 'error')
         return redirect(url_for('index'))
-        
+    
     return render_template('view_post.html', post=post, is_image_file=is_image_file, get_file_icon=get_file_icon)
 
 @app.route('/post/<int:post_id>/edit', methods=['POST'])
@@ -269,9 +306,12 @@ def edit_post(post_id):
         return redirect(url_for('login'))
     
     conn = get_db_connection()
-    post = conn.execute('SELECT * FROM posts WHERE id = ?', (post_id,)).fetchone()
-    
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute('SELECT * FROM posts WHERE id = %s', (post_id,))
+    post = cur.fetchone()
+
     if post is None or post['user_id'] != session['user_id']:
+        cur.close()
         conn.close()
         flash('You cannot edit this post!', 'error')
         return redirect(url_for('index'))
@@ -282,29 +322,27 @@ def edit_post(post_id):
     
     if file and file.filename:
         if allowed_file(file.filename):
-            if post['filepath']:
-                try:
-                    os.remove(post['filepath'])
-                except:
-                    pass
-            
+            # store bytes in DB
             filename = secure_filename(file.filename)
-            filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-            file.save(filepath)
+            file.stream.seek(0)
+            filedata = file.read()
+            mimetype = file.mimetype or None
         else:
             conn.close()
             flash('File type not allowed!', 'error')
             return redirect(url_for('view_post', post_id=post_id))
     else:
         filename = post['filename']
-        filepath = post['filepath']
+        filedata = post.get('filedata')
+        mimetype = post.get('mimetype')
     
-    conn.execute('''
+    cur.execute('''
         UPDATE posts 
-        SET title = ?, description = ?, filename = ?, filepath = ? 
-        WHERE id = ?
-    ''', (title, description, filename, filepath, post_id))
+        SET title = %s, description = %s, filename = %s, filedata = %s, mimetype = %s 
+        WHERE id = %s
+    ''', (title, description, filename, psycopg2.Binary(filedata) if filedata else None, mimetype, post_id))
     conn.commit()
+    cur.close()
     conn.close()
     
     flash('Post updated successfully!', 'success')
@@ -316,21 +354,20 @@ def delete_post(post_id):
         return redirect(url_for('login'))
     
     conn = get_db_connection()
-    post = conn.execute('SELECT * FROM posts WHERE id = ?', (post_id,)).fetchone()
-    
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute('SELECT * FROM posts WHERE id = %s', (post_id,))
+    post = cur.fetchone()
+
     if post is None or post['user_id'] != session['user_id']:
+        cur.close()
         conn.close()
         flash('You cannot delete this post!', 'error')
         return redirect(url_for('index'))
-    
-    if post['filepath']:
-        try:
-            os.remove(post['filepath'])
-        except:
-            pass
-    
-    conn.execute('DELETE FROM posts WHERE id = ?', (post_id,))
+
+    # file is stored in DB (filedata); just delete the row
+    cur.execute('DELETE FROM posts WHERE id = %s', (post_id,))
     conn.commit()
+    cur.close()
     conn.close()
     
     flash('Post deleted successfully!', 'success')
@@ -343,13 +380,16 @@ def posts():
         return redirect(url_for('login'))
     
     conn = get_db_connection()
-    posts = conn.execute('''
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute('''
         SELECT posts.*, users.username 
         FROM posts 
         JOIN users ON posts.user_id = users.id 
-        WHERE posts.user_id = ?
+        WHERE posts.user_id = %s
         ORDER BY posts.created_at DESC
-    ''', (session['user_id'],)).fetchall()
+    ''', (session['user_id'],))
+    posts = cur.fetchall()
+    cur.close()
     conn.close()
     
     return render_template('posts.html', posts=posts, is_image_file=is_image_file, get_file_icon=get_file_icon)
@@ -358,18 +398,21 @@ def posts():
 def download_file(filename):
     if not is_logged_in():
         return redirect(url_for('login'))
-    
+
     try:
-        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-        if not os.path.exists(filepath):
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute('SELECT filename, filedata, mimetype FROM posts WHERE filename = %s', (filename,))
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+
+        if not row or not row[1]:
             flash('File not found!', 'error')
             return redirect(url_for('index'))
-            
-        return send_from_directory(
-            app.config['UPLOAD_FOLDER'],
-            filename,
-            as_attachment=True
-        )
+
+        fname, filedata, mimetype = row[0], row[1], row[2]
+        return send_file(BytesIO(filedata), as_attachment=True, download_name=fname, mimetype=mimetype)
     except Exception as e:
         flash('Error downloading file!', 'error')
         return redirect(url_for('index'))
@@ -393,14 +436,17 @@ def reset_request():
     if request.method == 'POST':
         email = request.form['email']
         conn = get_db_connection()
-        user = conn.execute('SELECT * FROM users WHERE email = ?', (email,)).fetchone()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute('SELECT * FROM users WHERE email = %s', (email,))
+        user = cur.fetchone()
+        cur.close()
         conn.close()
-        
+
         if user:
             token = s.dumps(email, salt='password-reset-salt')
-            
+
             send_reset_email(email, token)
-            
+
             flash('An email has been sent with instructions to reset your password.', 'info')
             return redirect(url_for('login'))
         else:
@@ -428,11 +474,13 @@ def reset_token(token):
             return render_template('reset_token.html', token=token)
         
         conn = get_db_connection()
+        cur = conn.cursor()
         hashed_password = generate_password_hash(password)
-        conn.execute('UPDATE users SET password = ? WHERE email = ?', (hashed_password, email))
+        cur.execute('UPDATE users SET password = %s WHERE email = %s', (hashed_password, email))
         conn.commit()
+        cur.close()
         conn.close()
-        
+
         flash('Your password has been updated! You are now able to log in', 'success')
         return redirect(url_for('login'))
         
