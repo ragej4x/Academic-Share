@@ -20,8 +20,8 @@
                     <p class="post-preview">{{ post.description[:150] }}{% if post.description|length > 150 %}...{% endif %}</p>
                     {% if post.filename %}
                         <div class="post-attachment">
-                            {% if is_image_file(post.filepath) %}
-                                <img src="{{ url_for('static', filename='uploads/' + post.filename) }}" alt="Post thumbnail" class="post-thumbnail">
+                            {% if is_image_file(post.mimetype) %}
+                                <img src="{{ url_for('download_file', filename=post.filename) }}" alt="Post thumbnail" class="post-thumbnail">
                             {% else %}
                                 <div class="file-icon">
                                     <i class="fas fa-{{ post.filename|get_file_icon }}"></i>

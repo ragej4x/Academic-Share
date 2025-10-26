@@ -28,8 +28,8 @@
                 <p class="post-description">{{ post.description }}</p>
                 
                 {% if post.filename %}
-                    {% if is_image_file(post.filepath) %}
-                        <img src="{{ url_for('static', filename='uploads/' + post.filename) }}" alt="Post image" class="post-image">
+                    {% if is_image_file(post.mimetype) %}
+                        <img src="{{ url_for('download_file', filename=post.filename) }}" alt="Post image" class="post-image">
                     {% else %}
                         <div class="post-file">
                             <i class="fas fa-{{ post.filename|get_file_icon }}"></i>
