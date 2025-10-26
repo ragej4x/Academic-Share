@@ -3,4 +3,5 @@ Flask-Session==0.4.0
 Werkzeug==2.3.7
 standard-imghdr
 Flask-Mail
-psycopg2-binary==2.9.9
+psycopg2-binary
+
