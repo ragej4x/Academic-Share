@@ -25,7 +25,8 @@ def init_db():
         # Initialize Postgres DB and create tables if they don't exist
         conn = psycopg2.connect(app.config['DATABASE_URL'])
         cur = conn.cursor()
-
+        if not app.config['DATABASE_URL']:
+            raise ValueError("DATABASE_URL is not set in app configuration.")
         # Users table
         cur.execute('''CREATE TABLE IF NOT EXISTS users (
                                          id SERIAL PRIMARY KEY,
@@ -61,6 +62,8 @@ def init_db():
         conn.commit()
         cur.close()
         conn.close()
+        if "sslmode" not in app.config['DATABASE_URL']:
+            app.config['DATABASE_URL'] += "?sslmode=require"
 
 init_db()
 
@@ -485,6 +488,5 @@ def reset_token(token):
         return redirect(url_for('login'))
         
     return render_template('reset_token.html', token=token)
-
 if __name__ == '__main__':
     app.run(host='0.0.0.0',debug=True)
