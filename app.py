@@ -1,492 +1,461 @@
-from flask import Flask, render_template, request, redirect, url_for, session, flash, send_file
-from werkzeug.security import generate_password_hash, check_password_hash
-from werkzeug.utils import secure_filename
-from flask_mail import Mail, Message
-from itsdangerous import URLSafeTimedSerializer
-import secrets
 import os
-import psycopg2
-import psycopg2.extras
-from io import BytesIO
-import imghdr
+import secrets
 from datetime import datetime
 
+from flask import Flask, redirect, render_template, request, session, url_for, jsonify, abort
+from flask_login import LoginManager, UserMixin, login_user, logout_user, current_user, login_required
+from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, ForeignKey, Text
+from sqlalchemy.orm import declarative_base, sessionmaker, relationship, scoped_session
+from authlib.integrations.flask_client import OAuth
+from dotenv import load_dotenv
+import requests
+from werkzeug.security import generate_password_hash, check_password_hash
+
+
+# Load environment variables
+load_dotenv()
+
+
+# Basic Flask setup
 app = Flask(__name__)
-app.config.from_pyfile('config.py')
-
-# Initialize Flask-Mail
-mail = Mail(app)
-
-# Initialize Serializer for secure tokens
-s = URLSafeTimedSerializer(app.config['SECRET_KEY'])
+app.secret_key = os.getenv("FLASK_SECRET_KEY", secrets.token_hex(16))
 
 
-def init_db():
-        # Initialize Postgres DB and create tables if they don't exist
-        conn = psycopg2.connect(app.config['DATABASE_URL'])
-        cur = conn.cursor()
-        if not app.config['DATABASE_URL']:
-            raise ValueError("DATABASE_URL is not set in app configuration.")
-        # Users table
-        cur.execute('''CREATE TABLE IF NOT EXISTS users (
-                                         id SERIAL PRIMARY KEY,
-                                         username TEXT UNIQUE NOT NULL,
-                                         email TEXT UNIQUE NOT NULL,
-                                         first_name TEXT NOT NULL,
-                                         last_name TEXT NOT NULL,
-                                         section TEXT NOT NULL,
-                                         lrn TEXT UNIQUE NOT NULL,
-                                         password TEXT NOT NULL,
-                                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+# Three-color theme (used in templates)
+THEME = {
+    "bg": "#0B0C10",       # background
+    "primary": "#66FCF1",  # primary accent
+    "muted": "#45A29E",    # secondary
+}
 
-                                     )''')
 
-        # Posts table (store file binary data in DB using bytea)
-        cur.execute('''CREATE TABLE IF NOT EXISTS posts (
-                                         id SERIAL PRIMARY KEY,
-                                         user_id INTEGER NOT NULL,
-                                         title TEXT NOT NULL,
-                                         description TEXT,
-                                         filename TEXT,
-                                         filedata BYTEA,
-                                         mimetype TEXT,
-                                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                                         FOREIGN KEY (user_id) REFERENCES users (id)
-                                     )''')
+# Database setup: prefer DATABASE_URL (e.g., Supabase Postgres), fallback to local SQLite
+db_url_env = os.getenv("DATABASE_URL", "").strip()
+if db_url_env:
+    # Prefer psycopg (v3) driver for Postgres if not explicitly set
+    if db_url_env.startswith("postgresql://") and "+" not in db_url_env.split("://", 1)[0]:
+        DATABASE_URL = "postgresql+psycopg://" + db_url_env.split("://", 1)[1]
+    else:
+        DATABASE_URL = db_url_env
+else:
+    DATABASE_URL = "sqlite:///app.db"
 
-        # If this app was previously using a posts table with 'filepath', ensure new columns exist.
-        # ALTER TABLE ... ADD COLUMN IF NOT EXISTS is safe when upgrading an existing DB.
-        cur.execute("ALTER TABLE posts ADD COLUMN IF NOT EXISTS filedata BYTEA")
-        cur.execute("ALTER TABLE posts ADD COLUMN IF NOT EXISTS mimetype TEXT")
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 
-        conn.commit()
-        cur.close()
-        conn.close()
-        if "sslmode" not in app.config['DATABASE_URL']:
-            app.config['DATABASE_URL'] += "?sslmode=require"
+SessionLocal = scoped_session(sessionmaker(bind=engine, autoflush=False, autocommit=False))
+Base = declarative_base()
 
-init_db()
 
-def get_db_connection():
-    # Return a new psycopg2 connection. Callers should close it.
-    # Use RealDictCursor when creating cursors to get dict-like rows.
-    conn = psycopg2.connect(app.config['DATABASE_URL'])
-    return conn
+class User(Base, UserMixin):
+    __tablename__ = "users"
+    id = Column(Integer, primary_key=True)
+    email = Column(String(255), unique=True, nullable=False, index=True)
+    name = Column(String(255), nullable=True)
+    picture = Column(Text, nullable=True)
+    is_admin = Column(Boolean, default=False, nullable=False)
+    credits = Column(Integer, default=0, nullable=False)
+    api_key = Column(String(64), unique=True, nullable=False, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    password_hash = Column(Text, nullable=True)
 
-def is_logged_in():
-    return 'user_id' in session
+    logs = relationship("APILog", back_populates="user", cascade="all, delete-orphan")
 
-def allowed_file(filename):
-    return '.' in filename and \
-           filename.rsplit('.', 1)[1].lower() in app.config['ALLOWED_EXTENSIONS']
 
-def is_image_file(filepath):
-    """Check if the file is an image"""
-    # Accept either a filename (with extension) or a mimetype string
-    if not filepath:
-        return False
-    # If it's a mimetype like 'image/png'
-    if isinstance(filepath, str) and filepath.startswith('image/'):
-        return True
-    # Otherwise treat as filename
-    allowed_extensions = {'png', 'jpg', 'jpeg', 'gif'}
+class APILog(Base):
+    __tablename__ = "api_logs"
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    endpoint = Column(String(255), nullable=False)
+    cost = Column(Integer, default=0, nullable=False)
+    status = Column(String(64), default="success", nullable=False)
+    details = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    user = relationship("User", back_populates="logs")
+
+
+Base.metadata.create_all(bind=engine)
+
+# Ensure password_hash column exists for SQLite if table was created earlier without it
+try:
+    with engine.connect() as conn:
+        res = conn.exec_driver_sql("PRAGMA table_info('users')")
+        cols = [row[1] for row in res]
+        if 'password_hash' not in cols:
+            conn.exec_driver_sql("ALTER TABLE users ADD COLUMN password_hash TEXT")
+except Exception:
+    pass
+
+
+# Login manager
+login_manager = LoginManager(app)
+login_manager.login_view = "login"
+
+
+@login_manager.user_loader
+def load_user(user_id: str):
+    db = SessionLocal()
     try:
-        return '.' in filepath and filepath.rsplit('.', 1)[1].lower() in allowed_extensions
+        return db.get(User, int(user_id))
+    finally:
+        db.close()
+
+
+# OAuth (Google)
+oauth = OAuth(app)
+google = oauth.register(
+    name="google",
+    client_id=os.getenv("GOOGLE_CLIENT_ID"),
+    client_secret=os.getenv("GOOGLE_CLIENT_SECRET"),
+    server_metadata_url="https://accounts.google.com/.well-known/openid-configuration",
+    client_kwargs={"scope": "openid email profile"},
+)
+
+
+def get_or_create_user(email: str, name: str | None, picture: str | None):
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter_by(email=email).first()
+        if user:
+            # update basic profile fields on login
+            user.name = name or user.name
+            user.picture = picture or user.picture
+        else:
+            api_key = secrets.token_hex(24)
+            user = User(email=email, name=name, picture=picture, credits=0, is_admin=False, api_key=api_key)
+            db.add(user)
+        db.commit()
+        db.refresh(user)
+        return user
+    finally:
+        db.close()
+
+
+def current_user_or_api_key():
+    """Return (user, db_session) from login session or X-API-Key header/query. Caller must close db.
+    """
+    db = SessionLocal()
+    try:
+        if current_user.is_authenticated:
+            # refresh from DB to ensure latest credits
+            user = db.get(User, current_user.id)
+            return user, db
+
+        api_key = request.headers.get("X-API-Key") or request.args.get("api_key")
+        if api_key:
+            user = db.query(User).filter_by(api_key=api_key).first()
+            return user, db
+        return None, db
     except Exception:
-        return False
+        db.close()
+        raise
 
-def get_file_icon(filename):
-    """Return appropriate Font Awesome icon based on file type"""
-    if not filename:
-        return "file"
-    
-    ext = filename.lower().split('.')[-1]
-    icon_map = {
-        'pdf': 'file-pdf',
-        'doc': 'file-word',
-        'docx': 'file-word',
-        'txt': 'file-alt',
-        'zip': 'file-archive',
-        'rar': 'file-archive',
-        'png': 'file-image',
-        'jpg': 'file-image',
-        'jpeg': 'file-image',
-        'gif': 'file-image'
+
+@app.context_processor
+def inject_theme():
+    return {
+        "THEME": THEME,
+        "RECAPTCHA_SITE_KEY": os.getenv("RECAPTCHA_SITE_KEY", ""),
     }
-    return icon_map.get(ext, 'file')
 
-# Format date for display
-def format_date(value):
-    if value is None:
-        return ""
-    try:
-        dt = datetime.strptime(value, '%Y-%m-%d %H:%M:%S')
-        # Format it nicely like smoothhh butter
-        return dt.strftime('%b %d, %Y at %H:%M')
-    except:
-        return value
-
-app.jinja_env.filters['format_date'] = format_date
-app.jinja_env.filters['get_file_icon'] = get_file_icon
-app.jinja_env.filters['is_image_file'] = is_image_file
 
 # Routes
-@app.route('/')
+@app.get("/")
 def index():
-    if not is_logged_in():
-        return redirect(url_for('login'))
-    
-    conn = get_db_connection()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute('''
-        SELECT posts.*, users.username 
-        FROM posts 
-        JOIN users ON posts.user_id = users.id 
-        ORDER BY posts.created_at DESC
-    ''')
-    posts = cur.fetchall()
-    cur.close()
-    conn.close()
-    
-    return render_template('index.html', posts=posts, is_image_file=is_image_file)
-
-@app.route('/register', methods=['GET', 'POST'])
-def register():
-    if is_logged_in():
-        return redirect(url_for('index'))
-    
-    if request.method == 'POST':
-        username = request.form['username']
-        email = request.form['email']
-        first_name = request.form['first_name']
-        last_name = request.form['last_name']
-        section = request.form['section']
-        lrn = request.form['lrn']
-        password = request.form['password']
-        confirm_password = request.form['confirm_password']
-        
-        if not lrn.isdigit() or len(lrn) != 12:
-            flash('Invalid LRN format! Must be 12 digits.', 'error')
-            return render_template('register.html')
-        
-        if password != confirm_password:
-            flash('Passwords do not match!', 'error')
-            return render_template('register.html')
-        
-        hashed_password = generate_password_hash(password)
-        
-        conn = get_db_connection()
-        cur = conn.cursor()
-        try:
-            cur.execute('''INSERT INTO users 
-                          (username, email, first_name, last_name, section, lrn, password) 
-                          VALUES (%s, %s, %s, %s, %s, %s, %s)''',
-                        (username, email, first_name, last_name, section, lrn, hashed_password))
-            conn.commit()
-            flash('Registration successful! Please log in.', 'success')
-            return redirect(url_for('login'))
-        except psycopg2.IntegrityError as e:
-            conn.rollback()
-            msg = str(e)
-            # Try to detect which unique constraint failed
-            if 'username' in msg:
-                flash('Username already exists!', 'error')
-            elif 'email' in msg:
-                flash('Email already registered!', 'error')
-            elif 'lrn' in msg:
-                flash('LRN already registered!', 'error')
-            else:
-                flash('Registration failed!', 'error')
-        finally:
-            cur.close()
-            conn.close()
-    
-    return render_template('register.html')
+    if current_user.is_authenticated:
+        return redirect(url_for("dashboard"))
+    return render_template("index.html")
 
 
-@app.route('/login', methods=['GET', 'POST'])
+@app.get("/login")
 def login():
-    if is_logged_in():
-        return redirect(url_for('index'))
-    
-    if request.method == 'POST':
-        username = request.form['username']
-        password = request.form['password']
-        
-        conn = get_db_connection()
-        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute('SELECT * FROM users WHERE username = %s', (username,))
-        user = cur.fetchone()
-        cur.close()
-        conn.close()
+    redirect_uri = url_for("auth_callback", _external=True)
+    return google.authorize_redirect(redirect_uri)
 
-        if user and check_password_hash(user['password'], password):
-            session['user_id'] = user['id']
-            session['username'] = user['username']
-            flash('Login successful!', 'success')
-            return redirect(url_for('index'))
-        else:
-            flash('Invalid username or password!', 'error')
-    
-    return render_template('login.html')
 
-@app.route('/logout')
+@app.get("/auth/callback")
+def auth_callback():
+    token = google.authorize_access_token()
+    # Prefer parsing ID Token to avoid separate userinfo HTTP request
+    try:
+        info = google.parse_id_token(token)
+    except Exception:
+        # Fallback to userinfo endpoint if parsing fails
+        resp = google.get("https://openidconnect.googleapis.com/v1/userinfo")
+        info = resp.json()
+    email = info.get("email")
+    if not email:
+        abort(400, "Google login failed: no email")
+    user = get_or_create_user(email=email, name=info.get("name"), picture=info.get("picture"))
+    login_user(user)
+    return redirect(url_for("dashboard"))
+
+
+@app.post("/login_local")
+def login_local():
+    email = (request.form.get("email") or request.json.get("email") if request.is_json else "").strip().lower()
+    password = (request.form.get("password") or request.json.get("password") if request.is_json else "")
+    if not email or not password:
+        return redirect(url_for("index"))
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter_by(email=email).first()
+        if not user or not user.password_hash or not check_password_hash(user.password_hash, password):
+            return render_template("index.html", login_error="Invalid credentials"), 401
+        login_user(user)
+        return redirect(url_for("dashboard"))
+    finally:
+        db.close()
+
+
+@app.post("/register_local")
+def register_local():
+    email = (request.form.get("email") or request.json.get("email") if request.is_json else "").strip().lower()
+    password = (request.form.get("password") or request.json.get("password") if request.is_json else "")
+    name = (request.form.get("name") or request.json.get("name") if request.is_json else None)
+    if not email or not password:
+        return render_template("index.html", register_error="Email and password required"), 400
+    db = SessionLocal()
+    try:
+        existing = db.query(User).filter_by(email=email).first()
+        if existing and existing.password_hash:
+            return render_template("index.html", register_error="Email already registered"), 400
+        if existing and not existing.password_hash:
+            existing.password_hash = generate_password_hash(password)
+            db.commit()
+            login_user(existing)
+            return redirect(url_for("dashboard"))
+        api_key = secrets.token_hex(24)
+        user = User(email=email, name=name, credits=0, is_admin=False, api_key=api_key,
+                    password_hash=generate_password_hash(password))
+        db.add(user)
+        db.commit()
+        login_user(user)
+        return redirect(url_for("dashboard"))
+    finally:
+        db.close()
+
+
+@app.post("/logout")
 def logout():
-    session.clear()
-    flash('You have been logged out.', 'info')
-    return redirect(url_for('login'))
-
-@app.route('/post', methods=['GET', 'POST'])
-def post():
-    if not is_logged_in():
-        return redirect(url_for('login'))
-    
-    if request.method == 'POST':
-        title = request.form['title']
-        description = request.form['description']
-        file = request.files['file']
-        
-        if not title:
-            flash('Title is required!', 'error')
-            return render_template('post.html')
-        
-        filename = None
-        filedata = None
-        mimetype = None
-
-        if file and file.filename:
-            if allowed_file(file.filename):
-                filename = secure_filename(file.filename)
-                # read bytes into memory to store in DB
-                file.stream.seek(0)
-                filedata = file.read()
-                mimetype = file.mimetype or None
-                flash('File uploaded and stored in database!', 'success')
-            else:
-                flash('File type not allowed!', 'error')
-                return render_template('post.html')
-
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute('INSERT INTO posts (user_id, title, description, filename, filedata, mimetype) VALUES (%s, %s, %s, %s, %s, %s)',
-                 (session['user_id'], title, description, filename, psycopg2.Binary(filedata) if filedata else None, mimetype))
-        conn.commit()
-        cur.close()
-        conn.close()
-
-        flash('Your academic work has been shared!', 'success')
-        return redirect(url_for('index'))
-    
-    return render_template('post.html')
+    logout_user()
+    return redirect(url_for("index"))
 
 
-@app.route('/post/<int:post_id>')
-def view_post(post_id):
-    if not is_logged_in():
-        return redirect(url_for('login'))
-    
-    conn = get_db_connection()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute('''
-        SELECT posts.*, users.username 
-        FROM posts 
-        JOIN users ON posts.user_id = users.id 
-        WHERE posts.id = %s AND posts.user_id = %s
-    ''', (post_id, session['user_id']))
-    post = cur.fetchone()
-    cur.close()
-    conn.close()
-    
-    if post is None:
-        flash('Post not found or you do not have permission to view it!', 'error')
-        return redirect(url_for('index'))
-    
-    return render_template('view_post.html', post=post, is_image_file=is_image_file, get_file_icon=get_file_icon)
-
-@app.route('/post/<int:post_id>/edit', methods=['POST'])
-def edit_post(post_id):
-    if not is_logged_in():
-        return redirect(url_for('login'))
-    
-    conn = get_db_connection()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute('SELECT * FROM posts WHERE id = %s', (post_id,))
-    post = cur.fetchone()
-
-    if post is None or post['user_id'] != session['user_id']:
-        cur.close()
-        conn.close()
-        flash('You cannot edit this post!', 'error')
-        return redirect(url_for('index'))
-    
-    title = request.form['title']
-    description = request.form['description']
-    file = request.files['file']
-    
-    if file and file.filename:
-        if allowed_file(file.filename):
-            # store bytes in DB
-            filename = secure_filename(file.filename)
-            file.stream.seek(0)
-            filedata = file.read()
-            mimetype = file.mimetype or None
-        else:
-            conn.close()
-            flash('File type not allowed!', 'error')
-            return redirect(url_for('view_post', post_id=post_id))
-    else:
-        filename = post['filename']
-        filedata = post.get('filedata')
-        mimetype = post.get('mimetype')
-    
-    cur.execute('''
-        UPDATE posts 
-        SET title = %s, description = %s, filename = %s, filedata = %s, mimetype = %s 
-        WHERE id = %s
-    ''', (title, description, filename, psycopg2.Binary(filedata) if filedata else None, mimetype, post_id))
-    conn.commit()
-    cur.close()
-    conn.close()
-    
-    flash('Post updated successfully!', 'success')
-    return redirect(url_for('view_post', post_id=post_id))
-
-@app.route('/post/<int:post_id>/delete')
-def delete_post(post_id):
-    if not is_logged_in():
-        return redirect(url_for('login'))
-    
-    conn = get_db_connection()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute('SELECT * FROM posts WHERE id = %s', (post_id,))
-    post = cur.fetchone()
-
-    if post is None or post['user_id'] != session['user_id']:
-        cur.close()
-        conn.close()
-        flash('You cannot delete this post!', 'error')
-        return redirect(url_for('index'))
-
-    # file is stored in DB (filedata); just delete the row
-    cur.execute('DELETE FROM posts WHERE id = %s', (post_id,))
-    conn.commit()
-    cur.close()
-    conn.close()
-    
-    flash('Post deleted successfully!', 'success')
-    return redirect(url_for('index'))
-
-
-@app.route('/posts')
-def posts():
-    if not is_logged_in():
-        return redirect(url_for('login'))
-    
-    conn = get_db_connection()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute('''
-        SELECT posts.*, users.username 
-        FROM posts 
-        JOIN users ON posts.user_id = users.id 
-        WHERE posts.user_id = %s
-        ORDER BY posts.created_at DESC
-    ''', (session['user_id'],))
-    posts = cur.fetchall()
-    cur.close()
-    conn.close()
-    
-    return render_template('posts.html', posts=posts, is_image_file=is_image_file, get_file_icon=get_file_icon)
-
-@app.route('/download/<filename>')
-def download_file(filename):
-    if not is_logged_in():
-        return redirect(url_for('login'))
-
+@app.get("/dashboard")
+@login_required
+def dashboard():
+    db = SessionLocal()
     try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute('SELECT filename, filedata, mimetype FROM posts WHERE filename = %s', (filename,))
-        row = cur.fetchone()
-        cur.close()
-        conn.close()
-
-        if not row or not row[1]:
-            flash('File not found!', 'error')
-            return redirect(url_for('index'))
-
-        fname, filedata, mimetype = row[0], row[1], row[2]
-        return send_file(BytesIO(filedata), as_attachment=True, download_name=fname, mimetype=mimetype)
-    except Exception as e:
-        flash('Error downloading file!', 'error')
-        return redirect(url_for('index'))
+        user = db.get(User, current_user.id)
+        recent_logs = (
+            db.query(APILog)
+            .filter(APILog.user_id == user.id)
+            .order_by(APILog.created_at.desc())
+            .limit(10)
+            .all()
+        )
+        return render_template("dashboard.html", user=user, logs=recent_logs)
+    finally:
+        db.close()
 
 
-def send_reset_email(user_email, token):
-    msg = Message('Password Reset Request',
-                  recipients=[user_email])
-    msg.body = f'''To reset your password, visit the following link:
-{url_for('reset_token', token=token, _external=True)}
-
-If you did not make this request then simply ignore this email and no changes will be made.
-'''
-    mail.send(msg)
-
-@app.route("/reset_password", methods=['GET', 'POST'])
-def reset_request():
-    if is_logged_in():
-        return redirect(url_for('index'))
-    
-    if request.method == 'POST':
-        email = request.form['email']
-        conn = get_db_connection()
-        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute('SELECT * FROM users WHERE email = %s', (email,))
-        user = cur.fetchone()
-        cur.close()
-        conn.close()
-
-        if user:
-            token = s.dumps(email, salt='password-reset-salt')
-
-            send_reset_email(email, token)
-
-            flash('An email has been sent with instructions to reset your password.', 'info')
-            return redirect(url_for('login'))
-        else:
-            flash('No account found with that email address.', 'error')
-    
-    return render_template('reset_request.html')
-
-@app.route("/reset_password/<token>", methods=['GET', 'POST'])
-def reset_token(token):
-    if is_logged_in():
-        return redirect(url_for('index'))
-    
+@app.get("/admin")
+@login_required
+def admin():
+    if not current_user.is_authenticated:
+        return redirect(url_for("index"))
+    db = SessionLocal()
     try:
-        email = s.loads(token, salt='password-reset-salt', max_age=3600) 
-    except:
-        flash('That is an invalid or expired token', 'error')
-        return redirect(url_for('reset_request'))
-    
-    if request.method == 'POST':
-        password = request.form['password']
-        confirm_password = request.form['confirm_password']
-        
-        if password != confirm_password:
-            flash('Passwords do not match.', 'error')
-            return render_template('reset_token.html', token=token)
-        
-        conn = get_db_connection()
-        cur = conn.cursor()
-        hashed_password = generate_password_hash(password)
-        cur.execute('UPDATE users SET password = %s WHERE email = %s', (hashed_password, email))
-        conn.commit()
-        cur.close()
-        conn.close()
+        user = db.get(User, current_user.id)
+        if not user.is_admin:
+            abort(403)
+        return render_template("admin.html")
+    finally:
+        db.close()
 
-        flash('Your password has been updated! You are now able to log in', 'success')
-        return redirect(url_for('login'))
-        
-    return render_template('reset_token.html', token=token)
-if __name__ == '__main__':
-    app.run(host='0.0.0.0',debug=True)
+
+@app.post("/admin/credit")
+@login_required
+def admin_credit():
+    db = SessionLocal()
+    try:
+        admin_user = db.get(User, current_user.id)
+        if not admin_user.is_admin:
+            abort(403)
+        email = request.form.get("email", "").strip().lower()
+        amount = int(request.form.get("amount", "0") or 0)
+        if not email or amount == 0:
+            return render_template("admin.html", error="Email and amount required")
+        user = db.query(User).filter_by(email=email).first()
+        if not user:
+            return render_template("admin.html", error="User not found")
+        user.credits += amount
+        db.commit()
+        return render_template("admin.html", success=f"Added {amount} credits to {email}")
+    finally:
+        db.close()
+
+
+def log_api_usage(db, user_id: int, endpoint: str, cost: int, status: str, details: str | None = None):
+    entry = APILog(user_id=user_id, endpoint=endpoint, cost=cost, status=status, details=details)
+    db.add(entry)
+    db.commit()
+
+
+ESP32_BASE_URL = os.getenv("ESP32_BASE_URL", "http://192.168.1.200")
+SMS_COST = 1
+
+
+@app.post("/api/send_sms")
+def api_send_sms():
+    user, db = current_user_or_api_key()
+    try:
+        if not user:
+            return jsonify({"error": "Unauthorized"}), 401
+
+        data = request.get_json(silent=True) or {}
+        number = data.get("number")
+        message = data.get("message")
+        if not number or not message:
+            return jsonify({"error": "number and message are required"}), 400
+
+        # Normalize PH numbers to +639XXXXXXXXX
+        def normalize_ph_number(raw: str) -> str | None:
+            s = (raw or "").strip()
+            # keep digits only
+            digits = "".join(ch for ch in s if ch.isdigit())
+            if digits.startswith("63") and len(digits) == 12 and digits[2] == "9":
+                return "+" + digits
+            if digits.startswith("09") and len(digits) == 11:
+                return "+63" + digits[1:]
+            if digits.startswith("9") and len(digits) == 10:
+                return "+63" + digits
+            if s.startswith("+") and digits.startswith("63") and len(digits) == 12 and digits[2] == "9":
+                return "+" + digits
+            return None
+
+        normalized = normalize_ph_number(number)
+        if not normalized:
+            return jsonify({"error": "invalid_number_format", "expected": "+639XXXXXXXXX"}), 400
+
+        # Check credits
+        if user.credits < SMS_COST:
+            log_api_usage(db, user.id, "/api/send_sms", 0, "failed", "insufficient_credits")
+            return jsonify({"error": "Insufficient credits"}), 402
+
+        # Forward to ESP32
+        try:
+            esp_resp = requests.post(
+                f"{ESP32_BASE_URL}/api/sms/send",
+                json={"number": normalized, "message": message},
+                timeout=10,
+            )
+            ok = esp_resp.status_code == 200
+        except Exception as e:
+            ok = False
+            esp_resp = None
+            err = str(e)
+
+        if not ok:
+            details = f"esp_status={getattr(esp_resp, 'status_code', 'n/a')}"
+            log_api_usage(db, user.id, "/api/send_sms", 0, "failed", details)
+            return jsonify({"error": "ESP32 request failed"}), 502
+
+        # Deduct credits and log
+        user.credits -= SMS_COST
+        db.add(user)
+        db.commit()
+        log_api_usage(db, user.id, "/api/send_sms", SMS_COST, "success", None)
+
+        return jsonify({
+            "success": True,
+            "remaining_credits": user.credits,
+        })
+    finally:
+        db.close()
+
+
+@app.get("/me")
+def me():
+    user, db = current_user_or_api_key()
+    try:
+        if not user:
+            return jsonify({"authenticated": False}), 200
+        return jsonify({
+            "authenticated": True,
+            "email": user.email,
+            "credits": user.credits,
+            "api_key": user.api_key,
+            "is_admin": user.is_admin,
+        })
+    finally:
+        db.close()
+
+
+@app.get("/docs")
+def docs():
+    return render_template("docs.html")
+
+
+@app.get("/verify-wall")
+@login_required
+def verify_wall():
+    return render_template("verify_wall.html")
+
+
+@app.post("/api/claim_credits_wall")
+@login_required
+def claim_credits_wall():
+    db = SessionLocal()
+    try:
+        user = db.get(User, current_user.id)
+        user.credits += 3
+        db.commit()
+        return jsonify({"ok": True, "credits": user.credits, "added": 3})
+    finally:
+        db.close()
+
+@app.post("/api/claim_credits")
+@login_required
+def claim_credits():
+    db = SessionLocal()
+    try:
+        user = db.get(User, current_user.id)
+        data = request.get_json(silent=True) or {}
+        # Verify Google reCAPTCHA v2
+        recaptcha_token = data.get("recaptcha")
+        secret = os.getenv("RECAPTCHA_SECRET", "")
+        if not recaptcha_token or not secret:
+            return jsonify({"ok": False, "error": "captcha_required"}), 400
+        try:
+            verify_resp = requests.post(
+                "https://www.google.com/recaptcha/api/siteverify",
+                data={
+                    "secret": secret,
+                    "response": recaptcha_token,
+                    "remoteip": request.remote_addr or "",
+                },
+                timeout=8,
+            )
+            g = verify_resp.json()
+            if not g.get("success"):
+                return jsonify({"ok": False, "error": "captcha_failed"}), 400
+        except Exception:
+            return jsonify({"ok": False, "error": "captcha_verify_error"}), 400
+        user.credits += 3
+        db.commit()
+        return jsonify({"ok": True, "credits": user.credits, "added": 3})
+    finally:
+        db.close()
+
+
+def create_app():
+    return app
+
+
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", "5000"))
+    app.run(host="0.0.0.0", port=port, debug=True)
+
+

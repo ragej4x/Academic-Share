@@ -1,88 +1,37 @@
-
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AcademicShare - {% block title %}{% endblock %}</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-</head>
-<body>
-    <nav class="navbar">
-        <div class="nav-container">
-            <a href="{{ url_for('index') }}" class="nav-brand">
-                <i class="fas"></i> (Title or image dito)
-            </a>
-            
-            <button class="nav-toggle" aria-label="Toggle navigation">
-                <span class="hamburger"></span>
-            </button>
-            
-            <div class="nav-menu">
-                {% if session.user_id %}
-                    <span class="user-info"><i class="fas fa-user"></i> Hello, {{ session.username }}</span>
-                    <a href="{{ url_for('index') }}"><i class="fas fa-home"></i> Feed</a>
-                    <a href="{{ url_for('posts') }}"><i class="fas fa-book"></i> My Works</a>
-                    <a href="{{ url_for('post') }}"><i class="fas fa-share"></i> Share Work</a>
-                    <a href="{{ url_for('logout') }}"><i class="fas fa-sign-out-alt"></i> Logout</a>
-                {% else %}
-                    <a href="{{ url_for('login') }}"><i class="fas fa-sign-in-alt"></i> Login</a>
-                    <a href="{{ url_for('register') }}"><i class="fas fa-user-plus"></i> Register</a>
-                {% endif %}
-            </div>
-        </div>
-    </nav>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{{ title or 'GSM API' }}</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-6120309864804101" crossorigin="anonymous"></script>
+  </head>
+  <body style="--bg: {{ THEME.bg }}; --primary: {{ THEME.primary }}; --muted: {{ THEME.muted }};">
+    <header class="nav">
+      <a href="/" class="brand">FREE GSM PH</a>
+      <nav>
+        <a href="/docs">Docs</a>
+        {% if current_user.is_authenticated %}
+          <a href="/dashboard">Dashboard</a>
+          {% if current_user.is_authenticated and current_user.is_admin %}
+            <a href="/admin">Admin</a>
+          {% endif %}
+          <form action="/logout" method="post" style="display:inline">
+            <button class="btn small" type="submit">Logout</button>
+          </form>
+        {% else %}
+          <a class="btn" href="/login">Login with Google</a>
+        {% endif %}
+      </nav>
+    </header>
 
-    <div class="container">
-        {% with messages = get_flashed_messages(with_categories=true) %}
-            {% if messages %}
-                <div class="flash-messages">
-                    {% for category, message in messages %}
-                        <div class="flash flash-{{ category }}">
-                            {{ message }}
-                            <button class="close-btn" onclick="this.parentElement.style.display='none'">&times;</button>
-                        </div>
-                    {% endfor %}
-                </div>
-            {% endif %}
-        {% endwith %}
+    <main class="container">
+      {% block content %}{% endblock %}
+    </main>
 
-        {% block content %}{% endblock %}
-    </div>
-
-    <footer class="footer"> 
-        <p>&copy; Footer dito or pwede naman wala.</p>
-    </footer>
-
-    <script>
-        // Auto-hide flash messages after 5 seconds
-        setTimeout(() => {
-            const flashes = document.querySelectorAll('.flash');
-            flashes.forEach(flash => {
-                flash.style.display = 'none';
-            });
-        }, 5000);
-        
-        // Mobile navigation toggle
-        const navToggle = document.querySelector('.nav-toggle');
-        const navMenu = document.querySelector('.nav-menu');
-        
-        navToggle.addEventListener('click', () => {
-            navMenu.classList.toggle('nav-menu-active');
-            navToggle.classList.toggle('nav-toggle-active');
-        });
-        
-        // Close mobile menu when clicking on a link
-        const navLinks = document.querySelectorAll('.nav-menu a');
-        navLinks.forEach(link => {
-            link.addEventListener('click', () => {
-                navMenu.classList.remove('nav-menu-active');
-                navToggle.classList.remove('nav-toggle-active');
-            });
-        });
-        //(Bug @ ln 67) - Tapos na, linter erros.
-    </script>
-</body>
+    <footer class="footer">© {{ (now() if false) or '' }} FREE GSM PH</footer>
+  </body>
 </html>
+
+
